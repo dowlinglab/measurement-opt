@@ -16,6 +16,7 @@ from enum import Enum
 from dataclasses import dataclass
 import pickle
 from scipy.spatial import cKDTree
+import cvxpy as cp
 
 
 class CovarianceStructure(Enum):
@@ -54,6 +55,7 @@ class ObjectiveLib(Enum):
 
     A = 0
     D = 1
+    E = 2
 
     @classmethod
     def has_value(cls, value):
@@ -933,18 +935,18 @@ class MeasurementOptimizer:
         measurement_matrix: a full measurement matrix, construct the weights for covariances
         """
         # check if measurement vector legal
-        if len(measurement_vector) != self.total_no_measure:
+        if len(measurement_vector) != self.num_measure_dynamic_flatten:
             raise ValueError(
                 "Measurement vector is of wrong shape, expecting length of"
-                + str(self.total_no_measure)
+                + str(self.num_measure_dynamic_flatten)
             )
 
         # initialize measurement matrix as a 2D array
-        measurement_matrix = np.zeros((self.total_no_measure, self.total_no_measure))
+        measurement_matrix = np.zeros((self.num_measure_dynamic_flatten, self.num_measure_dynamic_flatten))
 
         # loop over total measurement index
-        for i in range(self.total_no_measure):
-            for j in range(self.total_no_measure):
+        for i in range(self.num_measure_dynamic_flatten):
+            for j in range(self.num_measure_dynamic_flatten):
                 measurement_matrix[i, j] = min(
                     measurement_vector[i], measurement_vector[j]
                 )
@@ -1389,7 +1391,7 @@ class MeasurementOptimizer:
 
                     def dynamic_manual_num(m):
                         """the timepoints for each dynamical measurement should be smaller than a given limit
-                        Eq. 11f in paper
+                        Eq. 11g in paper
                         """
                         start = (
                             self.n_static_measurements + i * self.dynamic_Nt
@@ -1610,12 +1612,12 @@ class MeasurementOptimizer:
         fim = np.zeros((self.no_param, self.no_param))
 
         # go over all measurement index
-        for m1_rank in range(self.total_no_measure):
+        for m1_rank in range(self.num_measure_dynamic_flatten):
             # get the corresponding gradient vector for this measurement
             # use np.matrix to keep the dimensions for the vector, otherwise numpy makes the vector 1D instead of Np*1
             jac_m1 = np.matrix(self.jac[m1_rank])
             # go over all measurement index
-            for m2_rank in range(self.total_no_measure):
+            for m2_rank in range(self.num_measure_dynamic_flatten):
                 # get the corresponding gradient vector for this measurement
                 jac_m2 = np.matrix(self.jac[m2_rank])
                 # solution of if these two measurements are selected
@@ -1985,6 +1987,39 @@ class MeasurementOptimizer:
             pickle.dump(fim_result, file2)
             file2.close()
 
+    def extract_store_sol_cvxpy(self, budget_opt, y_matrice, obj, fim, if_install_y, store_name):
+        """
+        Extract the solution, FIM, objective function from Cvxpy model, and store in two pickle files
+        "store_name + budget_opt": pickle file storing the y solution 
+        "store_name + fim + budget_opt": pickle file storing the FIM 
+
+        Arguments
+        ---------
+        :param budget_opt: budget of the problem 
+        :param y_matrice: the Cvxpy y matrice solution 
+        :param obj: the Cvxpy calculated objective function 
+        :param fim: the FIM calculated by Cvxpy 
+        :param if_install_y: DCM installaion binary variable solution 
+        :param store_name: if not None, store the solution and FIM in pickle file with the given name
+        """
+
+        # extract solution 
+        ans_y, sol_y = self.extract_solutions(y_matrice=y_matrice, if_install_y=if_install_y)
+        
+        # extract FIM 
+        if self.precompute_print_level >= 2:
+            print_fim(fim)
+            print("CVXPY calculated objective value:", obj.value)
+
+        if store_name:
+            file = open(store_name + str(budget_opt), "wb")
+            pickle.dump(ans_y, file)
+            file.close()
+
+            file2 = open(store_name + "fim_" + str(budget_opt), "wb")
+            pickle.dump(fim, file2)
+            file2.close()
+
     def _locate_initial_file(self, budget):
         """
         Given the budget, select which initial solution it should use by locating the closest budget that has stored solutions
@@ -2259,34 +2294,51 @@ class MeasurementOptimizer:
             print("warmstart initialize total dynamic: ", total_dynamic_initial)
             print("warmstart initialize cost:", cost_init)
 
-    def continuous_optimization_cvxpy(self, objective="D", budget=100, solver=None):
+    def continuous_optimization_cvxpy(self, objective=ObjectiveLib.D, 
+                                      budget=3000, 
+                                      mixed_integer = False, 
+                                      static_dynamic_pair = None,
+                                      time_interval_all_dynamic = False, 
+                                      num_dynamic_t_name = None,
+                                      surrogate_obj = True, 
+                                      solver=None, 
+                                      store_name = None):
         """
         This optimization problem can also be formulated and solved in the CVXPY framework.
-        This is a generalization code for CVXPY problems for reference, not currently used for the paper.
+        This is a generalization code for CVXPY problems for Eq. 11 in MO paper.
 
         Arguments
         ---------
         :param objective: can choose from 'D', 'A', 'E' for now. if defined others or None, use A-optimality.
-        :param cost_budget: give a total limit for costs.
+        :param budget: give a total limit for costs.
+        :param mixed_integer: if the problem is a mixed-integer problem, or relaxed
+        :param static_dynamic_pair: list of lists
+            a list of the name of measurements, that are selected as either dynamic or static measurements.
+        :param time_interval_all_dynamic: boolean
+            if True, the minimal time interval applies for all dynamical measurements
+        :param num_dynamic_t_name: list
+            a list of the exact time points for the dynamic-cost measurements time points
+        :param surrogate_obj: boolean 
+            if True, using a surrogate variable to be the objective, the objective function < surrogate variable 
+            if False, directly use the objective function to be the objective 
         :param solver: default to be MOSEK. Look for CVXPY document for more solver information.
+        :param store_name: string
+            name used to store the solution and objective function 
 
         Returns
         -------
         None
         """
 
-        # compute Atomic FIM
-        self.assemble_unit_fims()
-
-        # evaluate fim in the CVXPY framework
+        # evaluate fim in the CVXPY framework, Eq.(11a) in MO paper
         def eval_fim(y):
             """Evaluate FIM from y solution
             FIM = sum(cov_y[i,j]*unit FIM[i,j]) for all i, j in n_responses
             """
             fim = sum(
-                y[i, j] * self.unit_fims[i * self.total_no_measure + j]
-                for i in range(self.total_no_measure)
-                for j in range(self.total_no_measure)
+                y[i, j] * self.unit_fims[i * self.num_measure_dynamic_flatten + j]
+                for i in range(self.num_measure_dynamic_flatten)
+                for j in range(self.num_measure_dynamic_flatten)
             )
             return fim
 
@@ -2301,40 +2353,167 @@ class MeasurementOptimizer:
             return cp.log_det(fim)
 
         def e_opt(y):
-            """E-optimality as OBJ"""
+            """E-optimality as OBJ
+            This OBJ is not used for now (pending test)
+            """
             fim = eval_fim(y)
             return -cp.lambda_min(fim)
 
         # construct variables
-        y_matrice = cp.Variable(
-            (self.total_no_measure, self.total_no_measure), nonneg=True
-        )
+        if not mixed_integer: # continuous variables
+            y_matrice = cp.Variable(
+                (self.num_measure_dynamic_flatten, self.num_measure_dynamic_flatten), nonneg=True
+            )
+        else: # discrete binary variables
+            y_matrice = cp.Variable(
+                (self.num_measure_dynamic_flatten, self.num_measure_dynamic_flatten), boolean=True
+            )
+
+        # boolean for if a DCM is installed 
+        if_install_y = cp.Variable(self.n_dynamic_measurements, nonneg = True)
+
+        # surrogate objective
+        surro_obj = cp.Variable(nonneg = True)
 
         # cost limit
         p_cons = [
-            sum(y_matrice[i, i] * self.cost[i] for i in range(self.total_no_measure))
+            sum(y_matrice[i, i] * self.cost_list[i] for i in range(self.num_measure_dynamic_flatten)) # static and dynamic timepoint cost
+            + sum(if_install_y[i]*self.dynamic_install_cost[i] for i in range(self.n_dynamic_measurements)) # dynamic installation costs
             <= budget
         ]
 
         # loop over all measurement index
-        for k in range(self.total_no_measure):
+        for k in range(self.num_measure_dynamic_flatten):
             # loop over all measurement index
-            for l in range(self.total_no_measure):
-                # y[k,l] = y[k]*y[l] relaxation
+            for l in range(self.num_measure_dynamic_flatten):
+                # y[k,l] = y[k]*y[l] McCormick relaxation
                 p_cons += [y_matrice[k, l] <= y_matrice[k, k]]
                 p_cons += [y_matrice[k, l] <= y_matrice[l, l]]
                 p_cons += [y_matrice[k, k] + y_matrice[l, l] - 1 <= y_matrice[k, l]]
+                # symmetric matrix
                 p_cons += [y_matrice.T == y_matrice]
 
+        #total number of manual dynamical measurements number
+        #Eq. 11f in paper 
+        p_cons += [sum(y_matrice[i,i] for i in range(self.n_static_measurements, self.sens_info.total_measure_idx)) 
+                   <= self.manual_number]
+        
+        # loop over dynamical measurements
+        #the timepoints for each dynamical measurement should be smaller than a given limit
+        #Eq. 11g in paper       
+        for i in range(self.n_dynamic_measurements):
+            start = (
+                self.n_static_measurements + i * self.sens_info.Nt
+            )  # the start index of this dynamical measurement
+            end = (
+                self.n_static_measurements + (i + 1) * self.sens_info.Nt
+            )  # the end index of this dynamical measurement
+            # all time points for this DCM should be smaller than L_dynamic
+            p_cons += [sum(y_matrice[j, j] for j in range(start, end)) <= self.each_manual_number]
+
+        # if install a DCM 
+        for i in range(self.n_dynamic_measurements):
+            start = (
+                self.n_static_measurements + i * self.sens_info.Nt
+            )  # the start index of this dynamical measurement
+            end = (
+                self.n_static_measurements + (i + 1) * self.sens_info.Nt
+            )  # the end index of this dynamical measurement
+            # all time points for this DCM should be smaller than L_dynamic
+            for j in range(start, end):
+                p_cons += [if_install_y[i] >= y_matrice[j,j]]
+                
+            # constrains for if installing DCM
+            p_cons += [if_install_y[i] <= sum(y_matrice[k,k] for k in range(start, end))]
+            p_cons += [if_install_y[i] <= 1 ]
+                
+        # if some measurements can only be dynamic or static
+        if static_dynamic_pair is not None:
+            # loop over the index of the static, and dynamic measurements
+            for i, pair in enumerate(static_dynamic_pair):
+                # if_install_y needs a padding of self.n_static_measurements
+                p_cons += [if_install_y[pair[1]-self.n_static_measurements] + y_matrice[pair[0], pair[0]] <= 1]
+                    
+        # pair time index and real time
+        # for e.g., time 2h is the index 16, dynamic[16] = 2
+        # this is for the time interval between two DCMs computation
+        dynamic_time = {}
+        # loop over time index
+        for i in range(self.sens_info.Nt):
+            # index: real time
+            dynamic_time[i] = num_dynamic_t_name[i]
+        #self.dynamic_time = dynamic_time
+
+        # if there is minimal interval constraint
+        # Eq. 11h in the paper
+        if self.min_time_interval is not None:
+            # if this constraint applies to all dynamic measurements
+            if time_interval_all_dynamic:
+                for t in range(self.sens_info.Nt):
+                    # end time is an open end of the region, so another constraint needs to be added to include end_time
+                    # if dynamic_time[t]+discretize_time <= end_time+0.1*discretize_time:
+                    sumi = 0
+                    count = 0
+                    # get the timepoints in this interval
+                    while (count + t < self.sens_info.Nt) and (
+                        dynamic_time[count + t] - dynamic_time[t]
+                    ) < self.min_time_interval:
+                        for i in range(self.n_dynamic_measurements):
+                            surro_idx = (
+                                self.n_static_measurements
+                                + i
+                                * self.sens_info.Nt
+                                + t
+                                + count
+                            )
+                            sumi += y_matrice[surro_idx, surro_idx]
+                        count += 1
+
+                    p_cons += [sumi <= 1]
+
+            # if this constraint applies to each dynamic measurements, in a local way
+            else:
+                for i in range(self.n_dynamic_measurements):
+                    for t in range(self.sens_info.Nt):
+                        # end time is an open end of the region, so another constraint needs to be added to include end_time
+                        # if dynamic_time[t]+discretize_time <= end_time+0.1*discretize_time:
+
+                        # sumi is the summation of all measurements selected during this time interval
+                        sumi = 0
+                        # count helps us go through each time points in this time interval
+                        count = 0
+                        # get timepoints in this interval
+                        while (count + t < self.sens_info.Nt) and (
+                            dynamic_time[count + t] - dynamic_time[t]
+                        ) < self.min_time_interval:
+                            # surro_idx gets the index of the current time point
+                            surro_idx = (
+                                self.n_static_measurements
+                                + i
+                                * self.sens_info.Nt
+                                + t
+                                + count
+                            )
+                            # sum up all timepoints selections
+                            sumi += y_matrice[surro_idx, surro_idx]
+                            count += 1
+
+                        p_cons += [ sumi <= 1 ] 
+        
+
         # D-optimality
-        if objective == "D":
-            obj = cp.Maximize(d_opt(y_matrice))
+        if objective == ObjectiveLib.D:
+            if surrogate_obj:
+                p_cons += [surro_obj <= d_opt(y_matrice)]
+                obj = cp.Maximize(surro_obj)
+            else:
+                obj = cp.Maximize(d_opt(y_matrice))
         # E-optimality
-        elif objective == "E":
+        elif objective == ObjectiveLib.E:
             obj = cp.Maximize(e_opt(y_matrice))
         # A-optimality
         else:
-            if self.verbose:
+            if self.precompute_print_level >= 2:
                 print("Use A-optimality (Trace).")
             obj = cp.Maximize(a_opt(y_matrice))
 
@@ -2345,9 +2524,11 @@ class MeasurementOptimizer:
         else:
             problem.solve(solver=solver, verbose=True)
 
-        self.__solution_analysis(y_matrice, obj.value)
+        self.extract_store_sol_cvxpy(budget,y_matrice, obj, eval_fim(y_matrice).value, if_install_y, store_name)
 
-    def extract_solutions(self):
+        
+
+    def extract_solutions(self, y_matrice=None, if_install_y=None):
         """
         Extract and show solutions from a solved Pyomo model
         mod is an argument because we
@@ -2370,9 +2551,14 @@ class MeasurementOptimizer:
         for i in range(self.num_measure_dynamic_flatten):
             # loop over the measurement choice index
             for j in range(i, self.num_measure_dynamic_flatten):
-                cov = pyo.value(self.mod.cov_y[i, j])
+                if not y_matrice:
+                    cov = pyo.value(self.mod.cov_y[i, j])
+                else:
+                    cov = y_matrice[i,j].value    
                 # give value to its symmetric part
                 ans_y[i, j] = ans_y[j, i] = cov
+                
+
 
         # round small errors to integers
         # loop over all measurement choice
@@ -2403,7 +2589,7 @@ class MeasurementOptimizer:
             ]
         )
         # group DCM time points
-        sol_y = np.reshape(sol_y, (self.n_dynamic_measurements, self.dynamic_Nt))
+        sol_y = np.reshape(sol_y, (self.n_dynamic_measurements, self.sens_info.Nt))
         np.around(sol_y)
         # loop over each DCM
         for r in range(len(sol_y)):

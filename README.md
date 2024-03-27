@@ -58,6 +58,20 @@ The following instructions assume you have anaconda installed. We suggest create
 
   `conda install jupyter notebook`
 
+
+### (Optional) `Cvxpy` environment setting
+- this is needed only for constructing and solving the problem with `cvxpy`. 
+
+  Step 1: same as step 1 above to create the environment
+
+  Step 2: same as step 3 above to install dependencies
+
+  Step 3: install cvxpy with: 
+
+  `conda install -c conda-forge cvxpy`
+
+  Step 4: install `Mosek`. You need to validate a liscence for using this solver, see the link: https://docs.mosek.com/latest/install/installation.html
+
 ### Software versions we use for the results 
 
 `Python`: 3.8
@@ -69,6 +83,8 @@ The following instructions assume you have anaconda installed. We suggest create
 `GurobiPy`: 10.0.3
 
 `CyIpopt`: 1.3.0
+
+`Cvxpy`: 1.2.1
 
 ## Code 
 
@@ -82,6 +98,7 @@ The following instructions assume you have anaconda installed. We suggest create
 
 - `draw_figure.ipynb`: Generates all results figures in the manuscript
 
+- `cvxpy_problem.py`: Kinetics case study implemented with `Cvxpy`
 
 ## Example to run code and reproduce figures for case studies
 
@@ -129,7 +146,37 @@ Setup the scripts to reproduce result files and figures from the paper:
  
   - `plot_one_solution` receives and draws the solution of one measurement under four strategies. To reproduce result figure like Fig. S-2 in paper, call it 6 times to draw all 6 figures and combine to a panel figure. 
 
+
+### Kinetics case study with Cvxpy 
+
+- Step 1: run `cvxpy_problem.py`
+- Step 2: with `mip_option` and `objective`, choose to run the A-optimality or D-optimality, mixed-integer or relaxed problem 
+- Step 3: with `test`, set up the budget ranges as you want to try. 
+
+  If `test` is False: we use the budget range [1000, 5000] with a 400 discretization,
+  i.e. [1000, 1400, 1800, ..., 5000] for mixed-integer problems.
+
+  Otherwise, we use three budget [3000, 5000] to do a test run.
   
+- Step 4: store results for drawing figures
+
+  To do this, define the param `file_store_name` with a string you given, for e.g., "MINLP_result_".
+
+  Then both the solutions and the FIM of the results are stored separately.
+
+  For e.g., if running in the range [1000, 5000], the stored files will be:
+
+  MINLP_result_1000, MINLP_result_fim_1000,
+
+  ...
+
+  MINLP_result_5000, MINLP_result_fim_5000,
+  
+- Step 7: use draw_figure.ipynb to read stored FIM and solutions
+
+  - `read_fim` receives the string name, for.e.g. `MINLP_result_`, and budget ranges, returns a list of A- and D-optimality values of the given FIMs
+ 
+  - `plot_data` receives the Cvxpy solution and Pyomo solution, and draws them on the same figure
 
 ### Rotary bed case study 
 
